@@ -3,21 +3,20 @@ import os
 from typing import Dict, List, Optional
 
 import anthropic
-import Levenshtein
-from anytree import Node, RenderTree
 from langchain.callbacks.manager import CallbackManagerForRetrieverRun
 from langchain.retrievers import ContextualCompressionRetriever
 from langchain.retrievers.multi_query import MultiQueryRetriever
 from langchain.schema import BaseRetriever, Document
-from langchain_google_genai import GoogleGenerativeAIEmbeddings
-from langchain_openai import OpenAIEmbeddings
+from langchain_google_genai import ChatGoogleGenerativeAI, GoogleGenerativeAIEmbeddings
+from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 from langchain_voyageai import VoyageAIEmbeddings
+from langchain_community.chat_models import ChatOllama
 from pydantic import Field
+from sage.reranker import build_reranker
 
 from sage.code_symbols import get_code_symbols
 from sage.data_manager import DataManager, GitHubRepoManager
 from sage.llm import build_llm_via_langchain
-from sage.reranker import build_reranker
 from sage.vector_store import build_vector_store_from_args
 
 logging.basicConfig(level=logging.INFO)
@@ -33,33 +32,57 @@ class LLMRetriever(BaseRetriever):
 
     Builds a representation of the folder structure of the repo, feeds it to an LLM, and asks the LLM for the most
     relevant files for a particular user query, expecting it to make decisions based solely on file names.
-
-    Only works with Claude/Anthropic, because it's very slow (e.g. 15s for a mid-sized codebase) and we need prompt
-    caching to make it usable.
     """
 
     repo_manager: GitHubRepoManager = Field(...)
     top_k: int = Field(...)
+    llm_provider: str = Field(...)
 
     cached_repo_metadata: List[Dict] = Field(...)
     cached_repo_files: List[str] = Field(...)
     cached_repo_hierarchy: str = Field(...)
 
-    def __init__(self, repo_manager: GitHubRepoManager, top_k: int):
+    def __init__(self, repo_manager: GitHubRepoManager, top_k: int, llm_provider: str):
         super().__init__()
         self.repo_manager = repo_manager
         self.top_k = top_k
+        self.llm_provider = llm_provider
 
-        # We cached these fields manually because:
-        # 1. Pydantic doesn't work with functools's @cached_property.
-        # 2. We can't use Pydantic's @computed_field because these fields depend on each other.
-        # 3. We can't use functools's @lru_cache because LLMRetriever needs to be hashable.
+        # Cached fields
         self.cached_repo_metadata = None
         self.cached_repo_files = None
         self.cached_repo_hierarchy = None
 
-        if not os.environ.get("ANTHROPIC_API_KEY"):
-            raise ValueError("Please set the ANTHROPIC_API_KEY environment variable for the LLMRetriever.")
+        self._validate_llm_provider()
+
+    def _validate_llm_provider(self):
+        """Validate the LLM provider and ensure required API key is set."""
+        provider_key_map = {
+            'anthropic': 'ANTHROPIC_API_KEY',
+            'gemini': 'GOOGLE_API_KEY',
+            'openai': 'OPENAI_API_KEY',
+            'ollama': None  # Ollama doesn't require an API key
+        }
+
+        if self.llm_provider not in provider_key_map:
+            raise ValueError(f"Unsupported LLM provider: {self.llm_provider}")
+
+        api_key = provider_key_map.get(self.llm_provider)
+        if api_key and not os.environ.get(api_key):
+            raise ValueError(f"Please set the {api_key} environment variable for the LLMRetriever with {self.llm_provider}.")
+
+    def _get_llm_client(self):
+        """Get the appropriate LLM client based on the provider."""
+        if self.llm_provider == 'anthropic':
+            return anthropic.Anthropic()
+        elif self.llm_provider == 'gemini':
+            return ChatGoogleGenerativeAI(model="gemini-pro")
+        elif self.llm_provider == 'openai':
+            return ChatOpenAI(model="gpt-3.5-turbo")
+        elif self.llm_provider == 'ollama':
+            return ChatOllama(model="llama2")
+        else:
+            raise ValueError(f"Unsupported LLM provider: {self.llm_provider}")
 
     @property
     def repo_metadata(self):
@@ -90,11 +113,15 @@ class LLMRetriever(BaseRetriever):
         if self.cached_repo_hierarchy is None:
             render = LLMRetriever._render_file_hierarchy(self.repo_metadata, include_classes=True, include_methods=True)
             max_tokens = CLAUDE_MODEL_CONTEXT_SIZE - 50_000  # 50,000 tokens for other parts of the prompt.
-            client = anthropic.Anthropic()
+            client = self._get_llm_client()
 
             def count_tokens(x):
-                count = client.beta.messages.count_tokens(model=CLAUDE_MODEL, messages=[{"role": "user", "content": x}])
-                return count.input_tokens
+                if self.llm_provider == 'anthropic':
+                    count = client.beta.messages.count_tokens(model=CLAUDE_MODEL, messages=[{"role": "user", "content": x}])
+                    return count.input_tokens
+                else:
+                    # For other providers, we don't have a token counting API, so we just return a large number
+                    return 1000000
 
             if count_tokens(render) > max_tokens:
                 logging.info("File hierarchy is too large; excluding methods.")
@@ -108,9 +135,10 @@ class LLMRetriever(BaseRetriever):
                     )
                     if count_tokens(render) > max_tokens:
                         logging.info("File hierarchy is still too large; truncating.")
-                        tokenizer = anthropic.Tokenizer()
-                        tokens = tokenizer.tokenize(render)[:max_tokens]
-                        render = tokenizer.detokenize(tokens)
+                        if self.llm_provider == 'anthropic':
+                            tokenizer = anthropic.Tokenizer()
+                            tokens = tokenizer.tokenize(render)[:max_tokens]
+                            render = tokenizer.detokenize(tokens)
             self.cached_repo_hierarchy = render
         return self.cached_repo_hierarchy
 
@@ -156,7 +184,7 @@ User query: {user_query}
 
 DO NOT RESPOND TO THE USER QUERY DIRECTLY. Instead, respond with full paths to relevant files that could contain the answer to the query. Say absolutely nothing else other than the file paths.
 """
-        response = LLMRetriever._call_via_anthropic_with_prompt_caching(sys_prompt, augmented_user_query)
+        response = self._call_via_llm(sys_prompt, augmented_user_query)
 
         files_from_llm = response.content[0].text.strip().split("\n")
         validated_files = []
@@ -175,27 +203,27 @@ DO NOT RESPOND TO THE USER QUERY DIRECTLY. Instead, respond with full paths to r
                 validated_files.append(filename)
         return validated_files
 
-    @staticmethod
-    def _call_via_anthropic_with_prompt_caching(system_prompt: str, user_prompt: str) -> str:
-        """Calls the Anthropic API with prompt caching for the system prompt.
-
-        See https://docs.anthropic.com/en/docs/build-with-claude/prompt-caching.
-
-        We're circumventing LangChain for now, because the feature is < 1 week old at the time of writing and has no
-        documentation: https://github.com/langchain-ai/langchain/pull/27087
-        """
-        system_message = {"type": "text", "text": system_prompt, "cache_control": {"type": "ephemeral"}}
-        user_message = {"role": "user", "content": user_prompt}
-
-        response = anthropic.Anthropic().beta.prompt_caching.messages.create(
-            model=CLAUDE_MODEL,
-            max_tokens=1024,  # The maximum number of *output* tokens to generate.
-            system=[system_message],
-            messages=[user_message],
-        )
-        # Caching information will be under `cache_creation_input_tokens` and `cache_read_input_tokens`.
-        # Note that, for prompts shorter than 1024 tokens, Anthropic will not do any caching.
-        logging.info("Anthropic prompt caching info: %s", response.usage)
+    def _call_via_llm(self, system_prompt: str, user_prompt: str) -> str:
+        """Calls the LLM with prompt caching for the system prompt."""
+        client = self._get_llm_client()
+        if self.llm_provider == 'anthropic':
+            system_message = {"type": "text", "text": system_prompt, "cache_control": {"type": "ephemeral"}}
+            user_message = {"role": "user", "content": user_prompt}
+            response = client.beta.prompt_caching.messages.create(
+                model=CLAUDE_MODEL,
+                max_tokens=1024,  # The maximum number of *output* tokens to generate.
+                system=[system_message],
+                messages=[user_message],
+            )
+        else:
+            response = client.generate(
+                prompt=user_prompt,
+                max_tokens=1024,
+                temperature=0.0,
+                top_p=1.0,
+                frequency_penalty=0.0,
+                presence_penalty=0.0,
+            )
         return response
 
     @staticmethod
@@ -326,7 +354,13 @@ class RerankerWithErrorHandling(BaseRetriever):
 def build_retriever_from_args(args, data_manager: Optional[DataManager] = None):
     """Builds a retriever (with optional reranking) from command-line arguments."""
     if args.llm_retriever:
-        retriever = LLMRetriever(GitHubRepoManager.from_args(args), top_k=args.retriever_top_k)
+      # Create the retriever
+        retriever = LLMRetriever(
+            GitHubRepoManager.from_args(args),          
+            top_k=args.retriever_top_k, 
+            llm_provider="gemini"
+        )
+        retriever._validate_llm_provider()
     else:
         if args.embedding_provider == "openai":
             embeddings = OpenAIEmbeddings(model=args.embedding_model)
@@ -348,5 +382,8 @@ def build_retriever_from_args(args, data_manager: Optional[DataManager] = None):
 
     reranker = build_reranker(args.reranker_provider, args.reranker_model, args.reranker_top_k)
     if reranker:
-        retriever = ContextualCompressionRetriever(base_compressor=reranker, base_retriever=retriever)
+        retriever = ContextualCompressionRetriever(
+            base_compressor=reranker, base_retriever=retriever
+        )
+
     return retriever

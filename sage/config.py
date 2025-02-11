@@ -74,7 +74,6 @@ def add_config_args(parser: ArgumentParser):
 
 def add_repo_args(parser: ArgumentParser) -> Callable:
     """Adds repository-related arguments to the parser and returns a validator."""
-    parser.add("repo_id", help="The ID of the repository to index")
     parser.add("--commit-hash", help="Optional commit hash to checkout. When not provided, defaults to HEAD.")
     parser.add(
         "--local-dir",
@@ -221,10 +220,15 @@ def add_reranking_args(parser: ArgumentParser) -> Callable:
 
 def add_llm_args(parser: ArgumentParser) -> Callable:
     """Adds language model-related arguments to the parser."""
-    parser.add("--llm-provider", default="ollama", choices=["openai", "anthropic", "ollama"])
+    parser.add(
+        "--llm-provider",
+        default="gemini",  
+        choices=["gemini", "openai", "anthropic", "ollama"],
+        help="Language model provider to use",
+    )
     parser.add(
         "--llm-model",
-        help="The LLM name. Must be supported by the provider specified via --llm-provider.",
+        help="Specific model to use within the chosen provider",
     )
     # Trivial validator (nothing to check).
     return lambda _: True
@@ -232,20 +236,42 @@ def add_llm_args(parser: ArgumentParser) -> Callable:
 
 def add_all_args(parser: ArgumentParser) -> Callable:
     """Adds all arguments to the parser and returns a validator."""
+    # Add verbose flag
+    parser.add("--verbose", action="store_true", help="Enable verbose logging")
+    
+    # Add config arguments first
+    config_validator = add_config_args(parser)
+    
+    # Collect all validators
     arg_validators = [
-        add_config_args(parser),
+        config_validator,
         add_repo_args(parser),
         add_embedding_args(parser),
         add_vector_store_args(parser),
-        add_reranking_args(parser),
         add_indexing_args(parser),
         add_llm_args(parser),
+        add_reranking_args(parser),
     ]
-
+    
+    # Additional custom arguments to handle
+    parser.add("--pinecone-index-name", default=None, help="Pinecone index name (deprecated)")
+    parser.add("--hybrid-retrieval", action="store_true", help="Enable hybrid retrieval (default is already true)")
+    
     def validate_all(args):
+        # Run all validators
         for validator in arg_validators:
             validator(args)
-
+        
+        # Handle deprecated or additional arguments
+        if args.pinecone_index_name:
+            args.index_name = args.pinecone_index_name
+        
+        # Ensure verbose is always set
+        if not hasattr(args, 'verbose'):
+            args.verbose = False
+        
+        return args
+    
     return validate_all
 
 
@@ -374,10 +400,23 @@ def validate_embedding_args(args):
 def validate_vector_store_args(args):
     """Validates the configuration of the vector store and sets defaults."""
     if args.llm_retriever:
-        if not os.getenv("ANTHROPIC_API_KEY"):
+        # Define the API key requirements for different LLM providers
+        provider_key_map = {
+            'anthropic': 'ANTHROPIC_API_KEY',
+            'gemini': 'GOOGLE_API_KEY',
+            'openai': 'OPENAI_API_KEY',
+            'ollama': None  # Ollama doesn't require an API key
+        }
+
+        # Check if the LLM provider is supported
+        if args.llm_provider not in provider_key_map:
+            raise ValueError(f"Unsupported LLM provider: {args.llm_provider}")
+
+        # Check for required API key
+        api_key = provider_key_map.get(args.llm_provider)
+        if api_key and not os.getenv(api_key):
             raise ValueError(
-                "Please set the ANTHROPIC_API_KEY environment variable to use the LLM retriever. "
-                "(We're constrained to Claude because we need prompt caching.)"
+                f"Please set the {api_key} environment variable to use the LLM retriever with {args.llm_provider}."
             )
 
         if args.index_issues:
