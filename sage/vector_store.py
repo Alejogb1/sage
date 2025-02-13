@@ -2,6 +2,7 @@
 
 import logging
 import os
+import uuid
 from abc import ABC, abstractmethod
 from enum import Enum
 from functools import cached_property
@@ -136,24 +137,37 @@ class PineconeVectorStore(VectorStore):
         return index
 
     def ensure_exists(self):
-        if self.index_name not in self.client.list_indexes().names():
-            self.client.create_index(
-                name=self.index_name,
-                dimension=self.dimension,
-                # See https://www.pinecone.io/learn/hybrid-search-intro/
-                metric="dotproduct" if self.bm25_encoder else "cosine",
-                spec=ServerlessSpec(cloud="aws", region="us-east-1"),
-            )
+        """Ensures that the vector store exists. Creates it if it doesn't."""
+        logging.info(f"Ensuring Pinecone index {self.index_name} exists")
+        try:
+            if self.index_name not in self.client.list_indexes().names():
+                logging.info(f"Creating new Pinecone index {self.index_name}")
+                self.client.create_index(
+                    name=self.index_name,
+                    dimension=self.dimension,
+                    metric="cosine",
+                    spec=ServerlessSpec(cloud="aws", region="us-west-2"),
+                )
+            logging.info(f"Successfully connected to Pinecone index {self.index_name}")
+        except Exception as e:
+            logging.error(f"Error with Pinecone index: {str(e)}")
+            raise
 
     def upsert_batch(self, vectors: List[Vector], namespace: str):
-        pinecone_vectors = []
-        for i, (metadata, embedding) in enumerate(vectors):
-            vector = {"id": metadata.get("id", str(i)), "values": embedding, "metadata": metadata}
-            if self.bm25_encoder:
-                vector["sparse_values"] = self.bm25_encoder.encode_documents(metadata[TEXT_FIELD])
-            pinecone_vectors.append(vector)
-
-        self.index.upsert(vectors=pinecone_vectors, namespace=namespace)
+        """Upserts a batch of vectors."""
+        logging.info(f"Upserting {len(vectors)} vectors to namespace {namespace}")
+        try:
+            index = self.client.Index(self.index_name)
+            to_upsert = []
+            for metadata, embedding in vectors:
+                vector_id = str(uuid4())
+                to_upsert.append((vector_id, embedding, metadata))
+            
+            index.upsert(vectors=to_upsert, namespace=namespace)
+            logging.info(f"Successfully upserted {len(vectors)} vectors")
+        except Exception as e:
+            logging.error(f"Error upserting vectors: {str(e)}")
+            raise
 
     def as_retriever(self, top_k: int, embeddings: Embeddings, namespace: str):
         bm25_retriever = (

@@ -21,7 +21,7 @@ def main():
     parser = configargparse.ArgumentParser(description='Sage Indexing and Chat CLI')
     
     # Add repository ID as a positional argument BEFORE adding other arguments
-    parser.add_argument('repo_id', type=str, nargs='?', default="alejogb1/job-board", 
+    parser.add_argument('repo_id', type=str, nargs='?', default="Alejogb1/GiddySelfassuredConnections", 
                         help='The ID of the repository to index and chat with')
     
     # Add all other arguments
@@ -50,7 +50,7 @@ def main():
 
         # Start chat with the repository
         print("\nStarting interactive chat. Type your questions about the repository.")
-        sage_chat(args.repo_id, model=args.llm_provider)
+        sage_chat(args.repo_id, model="gemini")
     
     except Exception as e:
         print(f"An error occurred: {e}")

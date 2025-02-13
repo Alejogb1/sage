@@ -122,7 +122,7 @@ def add_embedding_args(parser: ArgumentParser) -> Callable:
 def add_vector_store_args(parser: ArgumentParser) -> Callable:
     """Adds vector store-related arguments to the parser and returns a validator."""
     parser.add(
-        "--vector-store-provider", default="marqo", choices=["pinecone", "marqo", "chroma", "faiss", "milvus", "qdrant"]
+        "--vector-store-provider", default="pinecone", choices=["pinecone", "marqo", "chroma", "faiss", "milvus", "qdrant"]
     )
     parser.add("--index-name", default="sage", help="Index name for the vector store index.")
     parser.add(
@@ -254,7 +254,7 @@ def add_all_args(parser: ArgumentParser) -> Callable:
     ]
     
     # Additional custom arguments to handle
-    parser.add("--pinecone-index-name", default=None, help="Pinecone index name (deprecated)")
+    parser.add("--pinecone-index-name", default="sage", help="Pinecone index name (deprecated)")
     parser.add("--hybrid-retrieval", action="store_true", help="Enable hybrid retrieval (default is already true)")
     
     def validate_all(args):

@@ -1,8 +1,9 @@
 import logging
 import os
 from typing import Dict, List, Optional
-
+from anytree import Node, RenderTree
 import anthropic
+import Levenshtein
 from langchain.callbacks.manager import CallbackManagerForRetrieverRun
 from langchain.retrievers import ContextualCompressionRetriever
 from langchain.retrievers.multi_query import MultiQueryRetriever
@@ -58,7 +59,6 @@ class LLMRetriever(BaseRetriever):
     def _validate_llm_provider(self):
         """Validate the LLM provider and ensure required API key is set."""
         provider_key_map = {
-            'anthropic': 'ANTHROPIC_API_KEY',
             'gemini': 'GOOGLE_API_KEY',
             'openai': 'OPENAI_API_KEY',
             'ollama': None  # Ollama doesn't require an API key
@@ -73,17 +73,10 @@ class LLMRetriever(BaseRetriever):
 
     def _get_llm_client(self):
         """Get the appropriate LLM client based on the provider."""
-        if self.llm_provider == 'anthropic':
-            return anthropic.Anthropic()
-        elif self.llm_provider == 'gemini':
-            return ChatGoogleGenerativeAI(model="gemini-pro")
-        elif self.llm_provider == 'openai':
-            return ChatOpenAI(model="gpt-3.5-turbo")
-        elif self.llm_provider == 'ollama':
-            return ChatOllama(model="llama2")
-        else:
-            raise ValueError(f"Unsupported LLM provider: {self.llm_provider}")
-
+        return ChatGoogleGenerativeAI(
+            model="gemini-1.5-flash",
+            convert_system_message_to_human=True  # Important: Gemini needs this to handle system messages
+        )       
     @property
     def repo_metadata(self):
         if not self.cached_repo_metadata:
@@ -112,33 +105,51 @@ class LLMRetriever(BaseRetriever):
         might include class and method names."""
         if self.cached_repo_hierarchy is None:
             render = LLMRetriever._render_file_hierarchy(self.repo_metadata, include_classes=True, include_methods=True)
-            max_tokens = CLAUDE_MODEL_CONTEXT_SIZE - 50_000  # 50,000 tokens for other parts of the prompt.
-            client = self._get_llm_client()
+            
+            # Set appropriate token limits based on the model
+            if self.llm_provider == 'anthropic':
+                max_tokens = CLAUDE_MODEL_CONTEXT_SIZE - 50_000  # 50,000 tokens for other parts of the prompt
+            elif self.llm_provider == 'gemini':
+                max_tokens = 500_000  # Being more conservative with Gemini's limit
+            else:
+                max_tokens = 250_000  # Very conservative default for other models
 
             def count_tokens(x):
                 if self.llm_provider == 'anthropic':
+                    client = self._get_llm_client()
                     count = client.beta.messages.count_tokens(model=CLAUDE_MODEL, messages=[{"role": "user", "content": x}])
                     return count.input_tokens
                 else:
-                    # For other providers, we don't have a token counting API, so we just return a large number
-                    return 1000000
+                    # More conservative estimate: ~2.5 characters per token
+                    return len(x) // 2.5
 
-            if count_tokens(render) > max_tokens:
+            # Progressive reduction of hierarchy complexity
+            current_tokens = count_tokens(render)
+            logging.info(f"Initial hierarchy token count estimate: {current_tokens}")
+            
+            if current_tokens > max_tokens:
                 logging.info("File hierarchy is too large; excluding methods.")
                 render = LLMRetriever._render_file_hierarchy(
                     self.repo_metadata, include_classes=True, include_methods=False
                 )
-                if count_tokens(render) > max_tokens:
+                current_tokens = count_tokens(render)
+                logging.info(f"Token count after excluding methods: {current_tokens}")
+                
+                if current_tokens > max_tokens:
                     logging.info("File hierarchy is still too large; excluding classes.")
                     render = LLMRetriever._render_file_hierarchy(
                         self.repo_metadata, include_classes=False, include_methods=False
                     )
-                    if count_tokens(render) > max_tokens:
+                    current_tokens = count_tokens(render)
+                    logging.info(f"Token count after excluding classes: {current_tokens}")
+                    
+                    if current_tokens > max_tokens:
                         logging.info("File hierarchy is still too large; truncating.")
-                        if self.llm_provider == 'anthropic':
-                            tokenizer = anthropic.Tokenizer()
-                            tokens = tokenizer.tokenize(render)[:max_tokens]
-                            render = tokenizer.detokenize(tokens)
+                        # More conservative truncation - use 2.5 chars per token and leave room for safety
+                        max_chars = int(max_tokens * 2.5 * 0.9)  # 10% safety margin
+                        render = render[:max_chars]
+                        logging.info(f"Final token count after truncation: {count_tokens(render)}")
+                        
             self.cached_repo_hierarchy = render
         return self.cached_repo_hierarchy
 
@@ -186,10 +197,13 @@ DO NOT RESPOND TO THE USER QUERY DIRECTLY. Instead, respond with full paths to r
 """
         response = self._call_via_llm(sys_prompt, augmented_user_query)
 
-        files_from_llm = response.content[0].text.strip().split("\n")
+        # All responses should now be strings, so we can process them directly
+        files_from_llm = response.strip().split("\n")
         validated_files = []
 
         for filename in files_from_llm:
+            if not filename or filename.isspace():
+                continue
             if filename not in self.repo_files:
                 if "/" not in filename:
                     # This is most likely some natural language excuse from the LLM; skip it.
@@ -204,28 +218,22 @@ DO NOT RESPOND TO THE USER QUERY DIRECTLY. Instead, respond with full paths to r
         return validated_files
 
     def _call_via_llm(self, system_prompt: str, user_prompt: str) -> str:
-        """Calls the LLM with prompt caching for the system prompt."""
+        """Calls the LLM with proper message formatting for Gemini."""
         client = self._get_llm_client()
-        if self.llm_provider == 'anthropic':
-            system_message = {"type": "text", "text": system_prompt, "cache_control": {"type": "ephemeral"}}
-            user_message = {"role": "user", "content": user_prompt}
-            response = client.beta.prompt_caching.messages.create(
-                model=CLAUDE_MODEL,
-                max_tokens=1024,  # The maximum number of *output* tokens to generate.
-                system=[system_message],
-                messages=[user_message],
-            )
+        
+        if self.llm_provider == 'gemini':
+            # For Gemini, we need to combine system and user prompts since it doesn't support system messages directly
+            combined_prompt = f"{system_prompt}\n\n{user_prompt}"
+            response = client.invoke(combined_prompt)
+            return response.content
         else:
-            response = client.generate(
-                prompt=user_prompt,
-                max_tokens=1024,
-                temperature=0.0,
-                top_p=1.0,
-                frequency_penalty=0.0,
-                presence_penalty=0.0,
-            )
-        return response
-
+            # Format as a list of tuples (role, content) for other providers
+            messages = [
+                ("system", system_prompt),
+                ("human", user_prompt)
+            ]
+            response = client.invoke(messages)
+            return response
     @staticmethod
     def _render_file_hierarchy(
         repo_metadata: List[Dict], include_classes: bool = True, include_methods: bool = True

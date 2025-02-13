@@ -22,7 +22,7 @@ load_dotenv()
 
 def build_rag_chain(args):
     """Builds a RAG chain via LangChain."""
-    llm = build_llm_via_langchain(args.llm_provider, args.llm_model)
+    llm = build_llm_via_langchain("gemini", args.llm_model)
     retriever = build_retriever_from_args(args)
 
     # Prompt to contextualize the latest query based on the chat history.

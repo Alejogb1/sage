@@ -10,6 +10,7 @@ from typing import Dict, Generator, List, Optional, Tuple
 
 import google.generativeai as genai
 import marqo
+import pinecone
 import requests
 from openai import OpenAI
 from tenacity import retry, stop_after_attempt, wait_random_exponential
@@ -229,6 +230,9 @@ class VoyageBatchEmbedder(BatchEmbedder):
         batch = []
         chunk_count = 0
 
+        request_count = 0
+        last_request_time = time.time()
+
         num_files = len([x for x in self.data_manager.walk(get_content=False)])
         pbar = tqdm(total=num_files, desc="Processing files", unit="file")
 
@@ -238,11 +242,6 @@ class VoyageBatchEmbedder(BatchEmbedder):
             batch.extend(chunks)
             pbar.update(1)
 
-            token_count = chunk_count * self.chunker.max_tokens
-            if token_count % 900_000 == 0:
-                logging.info("Pausing for 60 seconds to avoid rate limiting...")
-                time.sleep(60)  # Voyage API rate limits to 1m tokens per minute; we'll pause every 900k tokens.
-
             if len(batch) > chunks_per_batch:
                 for i in range(0, len(batch), chunks_per_batch):
                     sub_batch = batch[i : i + chunks_per_batch]
@@ -250,9 +249,23 @@ class VoyageBatchEmbedder(BatchEmbedder):
                     result = self._make_batch_request(sub_batch)
                     for chunk, datum in zip(sub_batch, result["data"]):
                         self.embedding_data.append((chunk.metadata, datum["embedding"]))
-                batch = []
+                    request_count += 1
 
-        # Finally, commit the last batch.
+                    # Check if we've made more than 1500 requests in the last minute
+                    # Rate limits here: https://ai.google.dev/gemini-api/docs/models/gemini
+                    current_time = time.time()
+                    elapsed_time = current_time - last_request_time
+                    if elapsed_time < 60 and request_count >= 1400:
+                        logging.info("Reached rate limit, pausing for 60 seconds...")
+                        time.sleep(60)
+                        last_request_time = current_time
+                        request_count = 0
+                    # Reset the last request time and request count if more than 60 sec have passed
+                    elif elapsed_time > 60:
+                        last_request_time = current_time
+                        request_count = 0
+
+                batch = []
         if batch:
             logging.info("Embedding %d chunks...", len(batch))
             result = self._make_batch_request(batch)
@@ -427,16 +440,83 @@ class GeminiBatchEmbedder(BatchEmbedder):
             yield chunk_metadata, embedding
 
 
-def build_batch_embedder_from_flags(data_manager: DataManager, chunker: Chunker, args) -> BatchEmbedder:
+class PineconeBatchEmbedder(BatchEmbedder):
+    """Batch embedder that uses Pinecone's built-in embedding models."""
+
+    def __init__(self, data_manager: DataManager, chunker: Chunker, embedding_model: str = "multilingual-e5-large"):
+        self.data_manager = data_manager
+        self.chunker = chunker
+        self.embedding_model = embedding_model
+        self.embedding_data = []
+        self.client = pinecone.Pinecone(api_key=os.environ["PINECONE_API_KEY"])
+
+    def _make_batch_request(self, chunks: List[Chunk]):
+        """Makes a batch request to Pinecone's embedding service."""
+        try:
+            embeddings = self.client.inference.embed(
+                self.embedding_model,
+                inputs=[chunk.content for chunk in chunks],
+                parameters={"input_type": "passage"}
+            )
+            return embeddings
+        except Exception as e:
+            logging.error(f"Error embedding batch: {e}")
+            return None
+
+    def embed_dataset(self, chunks_per_batch: int, max_embedding_jobs: int = None) -> str:
+        """Issues batch embedding jobs for the entire dataset."""
+        batch = []
+        chunk_count = 0
+        num_files = len([x for x in self.data_manager.walk(get_content=False)])
+        pbar = tqdm(total=num_files, desc="Processing files", unit="file")
+
+        for content, metadata in self.data_manager.walk():
+            chunks = self.chunker.chunk(content, metadata)
+            chunk_count += len(chunks)
+            batch.extend(chunks)
+            pbar.update(1)
+
+            if len(batch) >= chunks_per_batch:
+                embeddings = self._make_batch_request(batch)
+                if embeddings:
+                    for chunk, embedding in zip(batch, embeddings):
+                        self.embedding_data.append((chunk.metadata, embedding['values']))
+                batch = []
+
+        # Process remaining chunks
+        if batch:
+            embeddings = self._make_batch_request(batch)
+            if embeddings:
+                for chunk, embedding in zip(batch, embeddings):
+                    self.embedding_data.append((chunk.metadata, embedding['values']))
+
+        pbar.close()
+        logging.info(f"Embedded {chunk_count} chunks")
+        return "pinecone_embeddings"
+
+    def embeddings_are_ready(self, *args, **kwargs) -> bool:
+        """Embeddings are ready immediately since we process them synchronously."""
+        return True
+
+    def download_embeddings(self, *args, **kwargs) -> Generator[Vector, None, None]:
+        """Yields (chunk_metadata, embedding) pairs for each chunk in the dataset."""
+        for metadata, embedding in self.embedding_data:
+            yield metadata, embedding
+
+
+def build_batch_embedder_from_flags(data_manager: DataManager, chunker: Chunker, args):
+    """Builds a batch embedder from command-line arguments."""
     if args.embedding_provider == "openai":
-        return OpenAIBatchEmbedder(data_manager, chunker, args.local_dir, args.embedding_model, args.embedding_size)
+        return OpenAIBatchEmbedder(
+            data_manager, chunker, args.local_dir, args.embedding_model, args.embedding_size
+        )
     elif args.embedding_provider == "voyage":
         return VoyageBatchEmbedder(data_manager, chunker, args.embedding_model)
     elif args.embedding_provider == "marqo":
-        return MarqoEmbedder(
-            data_manager, chunker, index_name=args.index_namespace, url=args.marqo_url, model=args.embedding_model
-        )
+        return MarqoEmbedder(data_manager, chunker, args.index_name, args.marqo_url, args.embedding_model)
     elif args.embedding_provider == "gemini":
-        return GeminiBatchEmbedder(data_manager, chunker, embedding_model=args.embedding_model)
+        return GeminiBatchEmbedder(data_manager, chunker, args.embedding_model)
+    elif args.embedding_provider == "pinecone":
+        return PineconeBatchEmbedder(data_manager, chunker, args.embedding_model)
     else:
-        raise ValueError(f"Unrecognized embedder type {args.embedding_provider}")
+        raise ValueError(f"Unknown embedding provider: {args.embedding_provider}")

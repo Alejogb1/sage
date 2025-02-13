@@ -11,7 +11,6 @@ def build_llm_via_langchain(provider: str, model: str):
     # Define the API key requirements for different LLM providers
     provider_key_map = {
         'openai': 'OPENAI_API_KEY',
-        'anthropic': 'ANTHROPIC_API_KEY',
         'gemini': 'GOOGLE_API_KEY',
         'ollama': None  # Ollama doesn't require an API key
     }
@@ -28,8 +27,6 @@ def build_llm_via_langchain(provider: str, model: str):
     # Build the appropriate LLM based on the provider
     if provider == "openai":
         return ChatOpenAI(model=model or "gpt-4")
-    elif provider == "anthropic":
-        return ChatAnthropic(model=model or "claude-3-opus-20240229")
     elif provider == "ollama":
         return ChatOllama(model=model or "llama3.1")
     elif provider == "gemini":
