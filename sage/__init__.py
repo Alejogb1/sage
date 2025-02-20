@@ -35,7 +35,7 @@ def sage_index(repo_path: Optional[str] = None, verbose: bool = False):
         llm_retriever=False,
         embedding_model='text-embedding-004',
         llm_provider='gemini',
-        llm_model='gemini-1.5-flash',
+        llm_model='gemini-2.0-flash-exp',
         vector_store_provider='pinecone',
         retrieval_alpha=0.5,
         retriever_top_k=5
@@ -78,7 +78,7 @@ def sage_chat(repo_path: Optional[str] = None, query: Optional[str] = None,
     parser.set_defaults(
         repo_id=repo_path, 
         llm_provider=model, 
-        llm_model='gemini-1.5-flash'  
+        llm_model='gemini-2.0-flash-exp'  
     )
     
     # Parse arguments

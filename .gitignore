@@ -1,6 +1,19 @@
+Edit:
+.gitignore
++49
+-3
+5
+Preview
+Apply
+# Environment and virtual environments
 .env
-__pycache__
+.venv
+venv/
+env/
+sage_env/
+
+# Python bytecode and cache
+__pycache__/
+*.py[cod]
+*$py.class
 *.cpython.*
-build/
-repos/
-sage.egg-info/

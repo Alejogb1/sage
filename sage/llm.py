@@ -30,7 +30,7 @@ def build_llm_via_langchain(provider: str, model: str):
     elif provider == "ollama":
         return ChatOllama(model=model or "llama3.1")
     elif provider == "gemini":
-        return ChatGoogleGenerativeAI(model=model or "gemini-1.5-flash")
+        return ChatGoogleGenerativeAI(model=model or "gemini-2.0-flash-exp")
     
     # This line should never be reached due to the earlier check
     raise ValueError(f"Unrecognized LLM provider {provider}. Contributions are welcome!")

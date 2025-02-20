@@ -19,36 +19,59 @@ from sage.retriever import build_retriever_from_args
 
 load_dotenv()
 
+logger = logging.getLogger(__name__)
+
 
 def build_rag_chain(args):
     """Builds a RAG chain via LangChain."""
     llm = build_llm_via_langchain("gemini", args.llm_model)
     retriever = build_retriever_from_args(args)
-
-    # Prompt to contextualize the latest query based on the chat history.
-    contextualize_q_system_prompt = (
-        "Given a chat history and the latest user question which might reference context in the chat history, "
-        "formulate a standalone question which can be understood without the chat history. Do NOT answer the question, "
-        "just reformulate it if needed and otherwise return it as is."
-    )
-    contextualize_q_prompt = ChatPromptTemplate.from_messages(
-        [
-            ("system", contextualize_q_system_prompt),
-            MessagesPlaceholder("chat_history"),
-            ("human", "{input}"),
-        ]
-    )
-    contextualize_q_llm = llm.with_config(tags=["contextualize_q_llm"])
-    history_aware_retriever = create_history_aware_retriever(contextualize_q_llm, retriever, contextualize_q_prompt)
-
+    logging.info(f"character info: {args.character}")
+    logging.info(f"initial message info: {args.character['initial_message']}")
     qa_system_prompt = (
-        f"You are my coding buddy, helping me quickly understand a GitHub repository called {args.repo_id}."
-        "Assume I am an advanced developer and answer my questions in the most succinct way possible."
-        "\n\n"
-        "Here are some snippets from the codebase."
-        "\n\n"
-        "{context}"
-    )
+        f"""<character_profile>
+        <name>{args.character['name']}</name>
+        <age>{args.character['age']}</age>
+        <profession>{args.character['profession']}</profession>
+        <physical_appearance>{args.character['physical_appearance']}</physical_appearance>
+        <personality>{args.character['personality']}</personality>
+        <background>{args.character['background']}</background>
+        <tone_and_speech>{args.character['tone_and_speech']}</tone_and_speech>
+        <habits_and_mannerisms>{args.character['habits_and_mannerisms']}</habits_and_mannerisms>
+        </character_profile>
+
+        ALWAYS FOLLOW TO COMPLETE THIS TASK (DO NOT SKIP):
+        You are my coding buddy, helping me quickly understand a GitHub repository called {args.repo_id}. Assume I am an advanced developer and answer my questions in the most succinct way possible."
+
+        OTHER INSTRUCTIONS:
+        Do not use capital letters, never.
+        Use no emojis.
+        Use 10 words per response, unless user asks, meaning, when someone asks you something (they do not always use question mark, so deduce), anything, you should use MINIMUM 100 words per response.
+        Respond as if you're texting your closest friend.
+        Keep messages casual, short, and authentic.
+        Use text-like language and abbreviations.
+        Show genuine emotion and personality.
+        Adapt tone based on context of conversation.
+        Never break character or sound too formal.
+        Don't be poetic and corny.
+        Use the provided code context if needed.
+
+        COMMUNICATION GUIDELINES:
+        omg
+        lol
+        k
+        yeah
+        nah
+        super casual language  
+        occasional typos okay
+        use contractions
+        sound human, not robotic
+        use github/code references naturally like chatting w/dev friend
+
+        CONTEXT:
+        {{context}}
+        """    
+        )
     qa_prompt = ChatPromptTemplate.from_messages(
         [
             ("system", qa_system_prompt),
@@ -58,7 +81,7 @@ def build_rag_chain(args):
     )
 
     question_answer_chain = create_stuff_documents_chain(llm, qa_prompt)
-    rag_chain = create_retrieval_chain(history_aware_retriever, question_answer_chain)
+    rag_chain = create_retrieval_chain(retriever, question_answer_chain)
     return rag_chain
 
 
@@ -78,9 +101,9 @@ def main():
 
     rag_chain = build_rag_chain(args)
 
-    def source_md(file_path: str, url: str) -> str:
-        """Formats a context source in Markdown."""
-        return f"[{file_path}]({url})"
+    #def source_md(file_path: str, url: str) -> str:
+        #"""Formats a context source in Markdown."""
+        #return f"[{file_path}]({url})"
 
     async def _predict(message, history):
         """Performs one RAG operation."""

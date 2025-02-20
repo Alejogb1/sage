@@ -74,7 +74,7 @@ class LLMRetriever(BaseRetriever):
     def _get_llm_client(self):
         """Get the appropriate LLM client based on the provider."""
         return ChatGoogleGenerativeAI(
-            model="gemini-1.5-flash",
+            model="gemini-2.0-flash-exp",
             convert_system_message_to_human=True  # Important: Gemini needs this to handle system messages
         )       
     @property
